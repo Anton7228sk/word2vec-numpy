@@ -60,12 +60,12 @@ if __name__ == '__main__':
     if MAX_TOKENS:
         tokens = tokens[:MAX_TOKENS]
 
-    word_to_idx, idx_to_word, counts = build_vocab(tokens, min_count=MIN_COUNT)
+    word_to_idx, vocab, counts = build_vocab(tokens, min_count=MIN_COUNT)
     tokens = subsample(tokens, word_to_idx, counts)
     vocab_size = len(word_to_idx)
     print(f"Vocab: {vocab_size:,}  tokens after subsampling: {len(tokens):,}")
 
-    noise_dist = make_noise_dist(idx_to_word, counts)
+    noise_dist = make_noise_dist(vocab, counts)
 
     print("Generating skip-gram pairs ...")
     pairs = generate_pairs(tokens, word_to_idx, window_size=WINDOW_SIZE)
@@ -85,7 +85,7 @@ if __name__ == '__main__':
     probes = ['king', 'paris', 'python', 'science']
     print()
     for word in probes:
-        neighbors = model.nearest_neighbors(word, word_to_idx, idx_to_word, k=7)
+        neighbors = model.nearest_neighbors(word, word_to_idx, vocab, k=7)
         if neighbors:
             nn_str = ', '.join(f"{w} ({s:.3f})" for w, s in neighbors)
             print(f"{word}: {nn_str}")

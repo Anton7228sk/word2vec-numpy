@@ -18,6 +18,6 @@ class Word2Vec:
             return []
         vec   = self.W_in[word_to_idx[word]]
         norms = np.linalg.norm(self.W_in, axis=1)
-        sims  = self.W_in @ vec / (norms * np.linalg.norm(vec) + 1e-10)
+        sims  = self.W_in @ vec / (norms + 1e-10) / (np.linalg.norm(vec) + 1e-10)
         top_k = np.argsort(-sims)[1:k + 1]
         return [(idx_to_word[i], float(sims[i])) for i in top_k]

@@ -53,7 +53,7 @@ def train(model, pairs, noise_dist,
             neg_sig = sigmoid(neg_scores)   # (B, K)
 
             total_loss += (-np.sum(np.log(pos_sig + 1e-10))
-                           - np.sum(np.log(1.0 - neg_sig + 1e-10)))
+                           - np.sum(np.log(np.maximum(1.0 - neg_sig, 1e-10))))
 
             # Backward
             d_pos      = pos_sig - 1.0                                           # (B,)
