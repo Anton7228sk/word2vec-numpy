@@ -1,18 +1,7 @@
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-.venv/
-venv/
-env/
-
-# Data & model artefacts
 text8
+text8.txt
 text8.zip
-*.npy
-*.vocab.json
-
-# IDE
-.idea/
-.vscode/
-*.swp
+embeddings_in.npy
+embeddings_out.npy
+__pycache__/
+*.pyc

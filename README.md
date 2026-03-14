@@ -1,119 +1,77 @@
-# Word2Vec — pure NumPy implementation
+# Word2Vec — NumPy Implementation
 
-Skip-gram with Negative Sampling, implemented from scratch using only NumPy.
+Skip-gram with negative sampling, implemented from scratch using NumPy only (no PyTorch / TensorFlow).
 
-## Mathematical background
+## Method
 
-### Skip-gram objective
+**Skip-gram** predicts surrounding context words given a center word.
+**Negative sampling** replaces the expensive full-softmax with a binary classification task: distinguish the true context word from *K* noise words sampled from a smoothed unigram distribution.
 
-Given a corpus of tokens, for each center word **c** we want to maximise the likelihood of observing the surrounding context words **o** within a window of size **w**.
+Loss for a single (center, context) pair with *K* negatives:
 
-### Negative Sampling loss
+```
+L = -log σ(v_pos · u_c) - Σ_k log σ(-v_neg_k · u_c)
+```
 
-For one `(center c, context o)` pair, with **K** negatives sampled from a noise distribution:
+Gradients (derived analytically, using d/dx[-log σ(x)] = σ(x) - 1):
 
-$$J = -\log \sigma(\mathbf{u}_o \cdot \mathbf{v}_c) \;-\; \sum_{k=1}^{K} \log \sigma(-\mathbf{u}_k \cdot \mathbf{v}_c)$$
+```
+∂L/∂u_c     = (σ(v_pos · u_c) - 1) · v_pos  +  Σ_k σ(v_neg_k · u_c) · v_neg_k
+∂L/∂v_pos   = (σ(v_pos · u_c) - 1) · u_c
+∂L/∂v_neg_k =  σ(v_neg_k · u_c) · u_c
+```
 
-where
-- $\mathbf{v}_c = W_{\text{in}}[c]$ — center-word embedding
-- $\mathbf{u}_o = W_{\text{out}}[o]$ — context-word embedding
-- $\sigma(x) = \frac{1}{1+e^{-x}}$
-
-### Gradients (derived by chain rule)
-
-$$\frac{\partial J}{\partial \mathbf{v}_c} = (\sigma(\mathbf{u}_o \cdot \mathbf{v}_c) - 1)\,\mathbf{u}_o + \sum_{k} \sigma(\mathbf{u}_k \cdot \mathbf{v}_c)\,\mathbf{u}_k$$
-
-$$\frac{\partial J}{\partial \mathbf{u}_o} = (\sigma(\mathbf{u}_o \cdot \mathbf{v}_c) - 1)\,\mathbf{v}_c$$
-
-$$\frac{\partial J}{\partial \mathbf{u}_k} = \sigma(\mathbf{u}_k \cdot \mathbf{v}_c)\,\mathbf{v}_c \quad \text{for each negative } k$$
-
-Updates use plain SGD with linear learning-rate decay.
-
-### Noise distribution
-
-Negative words are drawn from $P_n(w) \propto \text{freq}(w)^{3/4}$, implemented with the **alias method** for O(1) sampling.
-
-### Subsampling of frequent words
-
-Each token is discarded before training with probability
-
-$$P_{\text{discard}}(w) = 1 - \sqrt{\frac{t}{\text{freq}(w)}}$$
-
-(threshold $t = 10^{-5}$ by default), reducing the dominance of stop-words.
-
----
+Parameters are updated with vanilla SGD with linear learning rate decay.
 
 ## Project structure
 
 ```
-word2vec.py    — Word2Vec class: forward pass, gradients, parameter update
-dataset.py     — Vocabulary, subsampling, pair generation, negative sampler
-train.py       — Full training script (text8 or any .txt corpus)
-evaluate.py    — Nearest-neighbour, analogy, and WordSim-353 evaluation
-demo.py        — Self-contained demo on a tiny built-in corpus (no download needed)
-requirements.txt
+data.py       tokenization, vocabulary, subsampling, skip-gram pair generation
+model.py      Word2Vec class (embedding matrices + nearest-neighbor search)
+train.py      training loop with mini-batch SGD
+main.py       entry point: downloads data, runs training, prints nearest neighbors
 ```
 
----
+## Key implementation details
 
-## Quick start
+- **Subsampling** — frequent words (the, a, …) are randomly discarded before pair generation, following Mikolov et al. (2013).
+- **Noise distribution** — negative samples are drawn from the unigram distribution raised to the 3/4 power.
+- **Noise table** — 10 M negative indices are pre-sampled once per run instead of calling `np.random.choice(p=...)` on every step, which is O(vocab\_size) and prohibitively slow.
+- **Mini-batch training** — pairs are processed in batches of 512 using vectorised `einsum` operations, reducing Python overhead by ~50×.
+- **Dynamic context window** — window size is sampled uniformly from [1, max\_window] for each center word, as in the original C implementation.
 
-### Run the demo (no download needed)
+## Setup
 
 ```bash
 pip install numpy
-python demo.py
+python main.py
 ```
 
-### Train on text8
+The script downloads and extracts the [text8](http://mattmahoney.net/dc/text8.zip) corpus (~100 MB) automatically on first run.
 
-```bash
-# Download the corpus (~100 MB)
-wget http://mattmahoney.net/dc/text8.zip
+Default hyperparameters (editable at the top of `main.py`):
 
-pip install numpy
-python train.py --data text8.zip --epochs 5 --embed-dim 100
+| Parameter | Value |
+|-----------|-------|
+| Embedding dim | 100 |
+| Window size | 5 |
+| Negative samples | 5 |
+| Epochs | 3 |
+| Learning rate | 0.025 |
+| Min word count | 5 |
+| Max tokens | 5 000 000 |
 
-# Evaluate
-python evaluate.py --vectors vectors.npy --vocab vectors.vocab.json
-```
+## Sample output
 
-### Train on any text file
-
-```bash
-python train.py --data my_corpus.txt --epochs 3 --embed-dim 50
-```
-
-### All training options
+Nearest neighbors by cosine similarity after 3 epochs on 5 M tokens:
 
 ```
---data         path to text8.zip or plain .txt file  (default: text8.zip)
---embed-dim    embedding dimensionality               (default: 100)
---window       maximum context window size            (default: 5)
---negatives    number of negative samples per pair    (default: 5)
---min-count    minimum word frequency                 (default: 5)
---subsample-t  subsampling threshold                  (default: 1e-5)
---lr           initial learning rate                  (default: 0.025)
---epochs       training epochs                        (default: 5)
---save         output path for W_in vectors (.npy)   (default: vectors.npy)
+king:    isabella (0.738), wessex (0.732), vii (0.722), sancho (0.717), vassal (0.715)
+paris:   rodin (0.732), villa (0.711), bologna (0.695), nuremberg (0.693), leipzig (0.685)
+python:  monty (0.823), clampett (0.811), rhino (0.808)   ← text8 is Wikipedia 2006; Monty Python dominates
+science: fiction (0.718), psychology (0.718), humanities (0.707), zoology (0.700)
 ```
-
----
-
-## Design decisions
-
-| Choice | Rationale |
-|--------|-----------|
-| Two weight matrices `W_in`, `W_out` | Faithful to the original paper; reduces hubness in the embedding space |
-| Alias method for negative sampling | O(1) per draw after O(V) pre-computation |
-| Dynamic window (uniform draw in [1, w]) | Same as the original C implementation — closer words receive higher weight implicitly |
-| Linear LR decay | Simple and effective; avoids the need for momentum or adaptive optimisers |
-| `np.add.at` for negative updates | Correctly accumulates gradients when the same word appears multiple times in `neg_ids` |
-
----
 
 ## References
 
-- Mikolov et al., *Efficient Estimation of Word Representations in Vector Space* (2013)
-- Mikolov et al., *Distributed Representations of Words and Phrases and their Compositionality* (2013)
-- Goldberg & Levy, *word2vec Explained* (2014)
+Mikolov, T. et al. (2013). *Distributed Representations of Words and Phrases and their Compositionality*. NeurIPS.

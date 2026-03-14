@@ -1,166 +1,73 @@
-"""
-Training script for Word2Vec (skip-gram + negative sampling).
-
-Usage
------
-# Download text8 first:
-#   wget http://mattmahoney.net/dc/text8.zip
-
-python train.py --data text8.zip --epochs 5 --embed-dim 100
-
-# Or with any plain text file:
-python train.py --data my_corpus.txt --epochs 3 --embed-dim 50
-"""
-
-import argparse
-import time
-from pathlib import Path
-
 import numpy as np
 
-from dataset import (
-    Vocabulary, NegativeSampler,
-    load_text8, load_plain_text,
-    subsample, generate_pairs,
-)
-from word2vec import Word2Vec
-from evaluate import evaluate_similarity
+from model import sigmoid
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description="Train Word2Vec (skip-gram + NS)")
-    p.add_argument("--data",        default="text8.zip", help="Path to text8.zip or any .txt file")
-    p.add_argument("--embed-dim",   type=int,   default=100,   help="Embedding dimensionality")
-    p.add_argument("--window",      type=int,   default=5,     help="Max context window size")
-    p.add_argument("--negatives",   type=int,   default=5,     help="Number of negative samples")
-    p.add_argument("--min-count",   type=int,   default=5,     help="Min word frequency")
-    p.add_argument("--subsample-t", type=float, default=1e-5,  help="Subsampling threshold")
-    p.add_argument("--lr",          type=float, default=0.025, help="Initial learning rate")
-    p.add_argument("--epochs",      type=int,   default=5,     help="Number of training epochs")
-    p.add_argument("--seed",        type=int,   default=42)
-    p.add_argument("--save",        default="vectors.npy",     help="Where to save W_in")
-    p.add_argument("--log-every",   type=int,   default=100_000, help="Print loss every N steps")
-    return p.parse_args()
+def make_noise_table(noise_dist, size=10_000_000):
+    # Pre-sample once per run; ~10x faster than calling np.random.choice(p=...) each step
+    return np.random.choice(len(noise_dist), size=size, p=noise_dist).astype(np.int32)
 
 
-def linear_lr_decay(initial_lr: float, step: int, total_steps: int) -> float:
-    """Linearly decay lr to 1e-4 * initial_lr over training."""
-    progress = step / total_steps
-    return max(initial_lr * (1.0 - progress), initial_lr * 1e-4)
+def train(model, pairs, noise_dist,
+          epochs=5, lr=0.025, num_neg=5, batch_size=512, log_every=500_000):
 
+    pairs_arr = np.array(pairs, dtype=np.int32)
+    n = len(pairs_arr)
 
-def main():
-    args = parse_args()
-    np.random.seed(args.seed)
+    noise_table = make_noise_table(noise_dist)
+    noise_ptr   = 0
 
-    # ------------------------------------------------------------------
-    # 1. Load corpus
-    # ------------------------------------------------------------------
-    data_path = Path(args.data)
-    if not data_path.exists():
-        raise FileNotFoundError(
-            f"{data_path} not found.\n"
-            "Download text8: wget http://mattmahoney.net/dc/text8.zip"
-        )
-    print(f"Loading corpus from {data_path} …")
-    if data_path.suffix == ".zip" or "text8" in data_path.name:
-        tokens = load_text8(str(data_path))
-    else:
-        tokens = load_plain_text(str(data_path))
-    print(f"  Raw tokens: {len(tokens):,}")
+    for epoch in range(epochs):
+        np.random.shuffle(pairs_arr)
+        total_loss = 0.0
+        lr_epoch   = lr * (1.0 - epoch / (epochs + 1))
 
-    # ------------------------------------------------------------------
-    # 2. Build vocabulary
-    # ------------------------------------------------------------------
-    vocab = Vocabulary(min_count=args.min_count).build(tokens)
-    print(f"  Vocabulary size: {len(vocab):,} (min_count={args.min_count})")
+        for start in range(0, n, batch_size):
+            batch = pairs_arr[start:start + batch_size]
+            B     = len(batch)
 
-    # ------------------------------------------------------------------
-    # 3. Subsample frequent words
-    # ------------------------------------------------------------------
-    tokens = subsample(tokens, vocab, t=args.subsample_t)
-    print(f"  Tokens after subsampling: {len(tokens):,}")
+            center_idx  = batch[:, 0]   # (B,)
+            context_idx = batch[:, 1]   # (B,)
 
-    # Convert to integer IDs (drop unknowns)
-    token_ids = np.array(
-        [vocab.word2id[w] for w in tokens if w in vocab.word2id],
-        dtype=np.int64,
-    )
+            # Pull negatives from pre-built table, wrap around if exhausted
+            end = noise_ptr + B * num_neg
+            if end <= len(noise_table):
+                neg_flat = noise_table[noise_ptr:end]
+            else:
+                noise_table[:] = make_noise_table(noise_dist, len(noise_table))
+                noise_ptr = 0
+                neg_flat  = noise_table[:B * num_neg]
+                end       = B * num_neg
+            noise_ptr = end % len(noise_table)
+            neg_indices = neg_flat.reshape(B, num_neg)   # (B, K)
 
-    # ------------------------------------------------------------------
-    # 4. Generate skip-gram pairs
-    # ------------------------------------------------------------------
-    print("Generating skip-gram pairs …")
-    pairs = generate_pairs(token_ids, window_size=args.window)
-    print(f"  Total pairs: {len(pairs):,}")
+            # Forward
+            u_c   = model.W_in[center_idx]               # (B, D)
+            v_pos = model.W_out[context_idx]             # (B, D)
+            v_neg = model.W_out[neg_indices]             # (B, K, D)
 
-    # ------------------------------------------------------------------
-    # 5. Initialise model and negative sampler
-    # ------------------------------------------------------------------
-    model   = Word2Vec(len(vocab), args.embed_dim, args.lr, seed=args.seed)
-    sampler = NegativeSampler(vocab, num_negatives=args.negatives)
-    pairs_arr = np.array(pairs, dtype=np.int64)
+            pos_scores = np.einsum('bd,bd->b', v_pos, u_c)          # (B,)
+            neg_scores = np.einsum('bkd,bd->bk', v_neg, u_c)        # (B, K)
 
-    # ------------------------------------------------------------------
-    # 6. Training loop
-    # ------------------------------------------------------------------
-    total_steps = len(pairs) * args.epochs
-    step        = 0
-    initial_lr  = args.lr
-    t0          = time.time()
+            pos_sig = sigmoid(pos_scores)   # (B,)
+            neg_sig = sigmoid(neg_scores)   # (B, K)
 
-    print(f"\nStarting training — {args.epochs} epoch(s), {total_steps:,} steps total\n")
+            total_loss += (-np.sum(np.log(pos_sig + 1e-10))
+                           - np.sum(np.log(1.0 - neg_sig + 1e-10)))
 
-    for epoch in range(1, args.epochs + 1):
-        # Shuffle pairs each epoch
-        idx = np.random.permutation(len(pairs_arr))
-        shuffled = pairs_arr[idx]
+            # Backward
+            d_pos      = pos_sig - 1.0                                           # (B,)
+            grad_u_c   = d_pos[:, None] * v_pos + np.einsum('bk,bkd->bd', neg_sig, v_neg)
+            grad_v_pos = d_pos[:, None] * u_c                                    # (B, D)
+            grad_v_neg = neg_sig[:, :, None] * u_c[:, None, :]                  # (B, K, D)
 
-        running_loss = 0.0
-        log_count    = 0
+            # np.add.at correctly accumulates when indices repeat within a batch
+            np.add.at(model.W_in,  center_idx,  -lr_epoch * grad_u_c)
+            np.add.at(model.W_out, context_idx, -lr_epoch * grad_v_pos)
+            np.add.at(model.W_out, neg_indices, -lr_epoch * grad_v_neg)
 
-        for center_id, context_id in shuffled:
-            neg_ids = sampler.sample(args.negatives, exclude=(int(center_id), int(context_id)))
+            done = start + B
+            if done % log_every < batch_size:
+                print(f"  step {done:>9,}/{n:,}  loss {total_loss / done:.4f}")
 
-            # Update learning rate
-            model.lr = linear_lr_decay(initial_lr, step, total_steps)
-
-            loss = model.train_step(int(center_id), int(context_id), neg_ids)
-            running_loss += loss
-            log_count    += 1
-            step         += 1
-
-            if step % args.log_every == 0:
-                avg_loss  = running_loss / log_count
-                elapsed   = time.time() - t0
-                progress  = step / total_steps * 100
-                print(
-                    f"  epoch {epoch}  |  progress {progress:5.1f}%  "
-                    f"|  loss {avg_loss:.4f}  |  lr {model.lr:.6f}  "
-                    f"|  {elapsed:.0f}s elapsed"
-                )
-                running_loss = 0.0
-                log_count    = 0
-
-        # Epoch-level quick evaluation
-        print(f"\n--- Epoch {epoch} complete ---")
-        evaluate_similarity(model, vocab, probes=["king", "man", "woman", "paris", "france"])
-        print()
-
-    # ------------------------------------------------------------------
-    # 7. Save vectors
-    # ------------------------------------------------------------------
-    save_path = Path(args.save)
-    np.save(save_path, model.W_in)
-    print(f"Saved W_in vectors to {save_path}")
-
-    # Optionally save vocabulary
-    import json
-    vocab_path = save_path.with_suffix(".vocab.json")
-    with open(vocab_path, "w") as f:
-        json.dump(vocab.word2id, f)
-    print(f"Saved vocabulary to {vocab_path}")
-
-
-if __name__ == "__main__":
-    main()
+        print(f"Epoch {epoch + 1}/{epochs}  avg loss {total_loss / n:.4f}  lr {lr_epoch:.5f}")
